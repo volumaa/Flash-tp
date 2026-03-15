@@ -1,0 +1,551 @@
+-- ╔══════════════════════════════╗
+-- ║   VSZ Hub  |  Flash TP       ║
+-- ║  discord.gg/NGEMSasjjG       ║
+-- ╚══════════════════════════════╝
+local Players             = game:GetService("Players")
+local TweenService        = game:GetService("TweenService")
+local RunService          = game:GetService("RunService")
+local CoreGui             = game:GetService("CoreGui")
+local UserInputService    = game:GetService("UserInputService")
+local StarterGui          = game:GetService("StarterGui")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local plr                 = Players.LocalPlayer
+local Camera              = workspace.CurrentCamera
+
+local CONFIG = { BLOCK_DELAY = 0.05 }
+
+-- ══════════════════════════════════════════════════════════════
+--  STATE
+-- ══════════════════════════════════════════════════════════════
+local autoGrab        = true
+local blockEnabled    = false
+local autoResetBalloon = false
+local _grabbing       = false
+
+-- ══════════════════════════════════════════════════════════════
+--  CHAR HELPERS
+-- ══════════════════════════════════════════════════════════════
+local function getRoot()
+    local c = plr.Character
+    return c and (c:FindFirstChild("HumanoidRootPart") or c:FindFirstChild("UpperTorso"))
+end
+local function getHum()
+    local c = plr.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function equipTool(name)
+    local hum = getHum(); if not hum then return end
+    local bp = plr:FindFirstChild("Backpack")
+    local tool = (bp and bp:FindFirstChild(name)) or (plr.Character and plr.Character:FindFirstChild(name))
+    if tool then hum:EquipTool(tool) end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  ADMIN REMOTE
+-- ══════════════════════════════════════════════════════════════
+local AdminRemote = nil
+task.spawn(function()
+    if not plr.Character then plr.CharacterAdded:Wait() end
+    task.wait(1)
+    local net = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Net")
+    local children = net:GetChildren()
+    local byIdx, byName = {}, {}
+    for i, obj in ipairs(children) do byIdx[i] = obj byName[obj.Name] = i end
+    local anchorIdx = byName["RF/a0e78691-cb9b-4efc-ac08-9c06fea70059"]
+    if anchorIdx then
+        local actual = byIdx[anchorIdx + 1]
+        if actual then AdminRemote = actual end
+    end
+end)
+
+local function spamAP(target)
+    if not AdminRemote or not target or target == plr then return end
+    local id = "f888ee6e-c86d-46e1-93d7-0639d6635d42"
+    for _, cmd in ipairs({"balloon","jumpscare","rocket","jail","ragdoll"}) do
+        task.spawn(function() AdminRemote:InvokeServer(id, target, cmd) end)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  BLOCK
+-- ══════════════════════════════════════════════════════════════
+local function confirmBlockDialog()
+    local robloxGui = CoreGui:FindFirstChild("RobloxGui")
+    if robloxGui then
+        for _, v in pairs(robloxGui:GetDescendants()) do
+            if v:IsA("TextButton") then
+                local t = v.Text:lower(); local n = v.Name:lower()
+                if t == "block" or n:find("block") or n:find("confirm") then
+                    local cx = v.AbsolutePosition.X + v.AbsoluteSize.X / 2
+                    local cy = v.AbsolutePosition.Y + v.AbsoluteSize.Y / 2
+                    for i = 1, 20 do
+                        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true,  game, 1)
+                        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+                    end
+                    return true
+                end
+            end
+        end
+    end
+    local view = Camera.ViewportSize
+    for _, yPct in ipairs({0.54, 0.57, 0.60, 0.63}) do
+        for i = 1, 10 do
+            VirtualInputManager:SendMouseButtonEvent(view.X/2, view.Y*yPct, 0, true,  game, 1)
+            VirtualInputManager:SendMouseButtonEvent(view.X/2, view.Y*yPct, 0, false, game, 1)
+        end
+    end
+end
+
+local blockedSet = {}
+local function blockPlayer(target)
+    if not target or target == plr then return end
+    if blockedSet[target.UserId] then return end
+    blockedSet[target.UserId] = true
+    task.spawn(function()
+        -- fire prompt and click simultaneously
+        pcall(function() StarterGui:SetCore("PromptBlockPlayer", target) end)
+        -- spam click immediately, dialog renders same frame on most devices
+        for attempt = 1, 8 do
+            task.wait(0.05)
+            confirmBlockDialog()
+        end
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  AUTO GRAB — RenderStepped, instant
+-- ══════════════════════════════════════════════════════════════
+local function getPromptPos(prompt)
+    local p = prompt.Parent
+    if p:IsA("BasePart") then return p.Position end
+    if p:IsA("Model") then
+        local prim = p.PrimaryPart or p:FindFirstChildWhichIsA("BasePart")
+        return prim and prim.Position
+    end
+    if p:IsA("Attachment") then return p.WorldPosition end
+    local part = p:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position
+end
+
+local function firePrompt(prompt)
+    pcall(function() fireproximityprompt(prompt, 9999) end)
+    pcall(function() prompt:InputHoldBegin() end)
+    task.spawn(function()
+        local t = 0
+        while t < 40 and not plr:GetAttribute("Stealing") do
+            RunService.Heartbeat:Wait() t += 1
+        end
+        while plr:GetAttribute("Stealing") do
+            RunService.Heartbeat:Wait()
+        end
+        pcall(function() prompt:InputHoldEnd() end)
+        task.wait(0.05)
+        _grabbing = false
+    end)
+end
+
+RunService.RenderStepped:Connect(function()
+    if not autoGrab or _grabbing then return end
+    if plr:GetAttribute("Stealing") then return end
+    local root = getRoot(); if not root then return end
+    local plots = workspace:FindFirstChild("Plots"); if not plots then return end
+    local myPos = root.Position
+    for _, plot in ipairs(plots:GetChildren()) do
+        for _, obj in ipairs(plot:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") and obj.Enabled and obj.ActionText == "Steal" then
+                local pos = getPromptPos(obj)
+                if pos and (myPos - pos).Magnitude <= math.max(obj.MaxActivationDistance, 12) then
+                    _grabbing = true
+                    firePrompt(obj)
+                    return
+                end
+            end
+        end
+    end
+end)
+
+plr.CharacterAdded:Connect(function(char)
+    _grabbing = false
+    pcall(function() plr:SetAttribute("Stealing", nil) end)
+    local hrp = char:WaitForChild("HumanoidRootPart", 5)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hrp or not hum then return end
+    task.wait(1.5)
+    -- bypass: fire the nearest steal prompt once silently to wake up the server-side steal handler
+    local plots = workspace:FindFirstChild("Plots")
+    if plots then
+        local myPos = hrp.Position
+        local nearest, minDist = nil, math.huge
+        for _, plot in ipairs(plots:GetChildren()) do
+            for _, obj in ipairs(plot:GetDescendants()) do
+                if obj:IsA("ProximityPrompt") and obj.Enabled and obj.ActionText == "Steal" then
+                    local pos = getPromptPos(obj)
+                    if pos then
+                        local d = (myPos - pos).Magnitude
+                        if d < minDist then minDist = d nearest = obj end
+                    end
+                end
+            end
+        end
+        if nearest then
+            pcall(function() fireproximityprompt(nearest, 9999) end)
+            pcall(function() nearest:InputHoldBegin() end)
+            task.wait(0.1)
+            pcall(function() nearest:InputHoldEnd() end)
+        end
+    end
+    task.wait(0.5)
+    _grabbing = false
+end)
+
+-- ══════════════════════════════════════════════════════════════
+--  INSTANT RESET
+-- ══════════════════════════════════════════════════════════════
+local function doInstantReset()
+    local char = plr.Character; if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp then return end
+    local ok = pcall(function()
+        local targetPart = workspace:FindFirstChild("CraftingMachine")
+            and workspace.CraftingMachine:FindFirstChild("VFX")
+            and workspace.CraftingMachine.VFX:FindFirstChild("Secret")
+            and workspace.CraftingMachine.VFX.Secret:FindFirstChild("SoundPart")
+        if targetPart then char:PivotTo(CFrame.new(targetPart.Position))
+        else error("no part") end
+    end)
+    if not ok then
+        local bp = plr:FindFirstChild("Backpack")
+        local carpet = (bp and bp:FindFirstChild("Flying Carpet")) or char:FindFirstChild("Flying Carpet")
+        if carpet then pcall(function() hum:EquipTool(carpet) end) end
+        for _, obj in ipairs(char:GetDescendants()) do
+            if obj:IsA("BallSocketConstraint") or obj:IsA("NoCollisionConstraint") or obj:IsA("HingeConstraint") then
+                pcall(function() obj:Destroy() end)
+            end
+        end
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 2147483647, 0)
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 2147483647, 0)
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 2147483647, 0)
+    end
+    hum.Health = 0
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  AUTO RESET ON BALLOON ONLY
+-- ══════════════════════════════════════════════════════════════
+task.spawn(function()
+    local function hookRemote(obj)
+        obj.OnClientEvent:Connect(function(...)
+            if not autoResetBalloon then return end
+            for _, v in ipairs({...}) do
+                if type(v) == "string" and v:lower() == "balloon" then
+                    task.wait(0.05)
+                    doInstantReset()
+                    return
+                end
+            end
+        end)
+    end
+    for _, obj in ipairs(game:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then hookRemote(obj) end
+    end
+    game.DescendantAdded:Connect(function(obj)
+        if obj:IsA("RemoteEvent") then hookRemote(obj) end
+    end)
+end)
+
+-- ══════════════════════════════════════════════════════════════
+--  GUI
+-- ══════════════════════════════════════════════════════════════
+pcall(function() CoreGui:FindFirstChild("VSZHub_FlashTP"):Destroy() end)
+
+local BG         = Color3.fromRGB(15, 15, 20)
+local CARD       = Color3.fromRGB(25, 25, 35)
+local HOVER      = Color3.fromRGB(40, 40, 56)
+local ORG        = Color3.fromRGB(255, 140, 0)
+local RED        = Color3.fromRGB(255, 70, 70)
+local TXT        = Color3.fromRGB(255, 255, 255)
+local TXT2       = Color3.fromRGB(170, 170, 190)
+local STRK       = Color3.fromRGB(55, 55, 75)
+local TWEEN_FAST = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local ROW_H    = 34
+local ROW_GAP  = 8
+local PAD_TOP  = 8
+local TITLE_H  = 34
+local NUM_ROWS = 5  -- FLASH TP, BLOCK, RESET, SPAM AP, AUTO RESET BALLOON
+local FULL_H   = TITLE_H + PAD_TOP + NUM_ROWS * ROW_H + (NUM_ROWS - 1) * ROW_GAP + 8
+local MINI_H   = TITLE_H + PAD_TOP + ROW_H + 8  -- title + only flash tp row
+
+local sg = Instance.new("ScreenGui", CoreGui)
+sg.Name = "VSZHub_FlashTP" sg.ResetOnSpawn = false sg.DisplayOrder = 9999
+
+local Main = Instance.new("Frame", sg)
+Main.Size = UDim2.new(0, 185, 0, FULL_H)
+Main.Position = UDim2.new(1, -195, 0, 10)
+Main.BackgroundColor3 = BG Main.BorderSizePixel = 0
+Main.ClipsDescendants = true Main.Active = true
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
+local mainStroke = Instance.new("UIStroke", Main)
+mainStroke.Color = STRK mainStroke.Thickness = 2
+
+-- title bar
+local TitleBar = Instance.new("Frame", Main)
+TitleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
+TitleBar.BackgroundColor3 = CARD TitleBar.BorderSizePixel = 0
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
+local tbFix = Instance.new("Frame", TitleBar)
+tbFix.Size = UDim2.new(1,0,0.5,0) tbFix.Position = UDim2.new(0,0,0.5,0)
+tbFix.BackgroundColor3 = CARD tbFix.BorderSizePixel = 0
+
+local TitleLabel = Instance.new("TextLabel", TitleBar)
+TitleLabel.Size = UDim2.new(1,-50,1,0) TitleLabel.Position = UDim2.new(0,12,0,0)
+TitleLabel.BackgroundTransparency = 1 TitleLabel.Text = "VSZ Hub"
+TitleLabel.TextColor3 = TXT TitleLabel.TextSize = 14 TitleLabel.Font = Enum.Font.GothamBlack
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left TitleLabel.TextYAlignment = Enum.TextYAlignment.Center
+local titleGrad = Instance.new("UIGradient", TitleLabel)
+titleGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, ORG),
+    ColorSequenceKeypoint.new(0.6, TXT),
+    ColorSequenceKeypoint.new(1, CARD),
+})
+
+-- collapse btn
+local ColWrap = Instance.new("Frame", TitleBar)
+ColWrap.Size = UDim2.new(0,24,0,18) ColWrap.Position = UDim2.new(1,-28,0.5,-9)
+ColWrap.BackgroundColor3 = Color3.fromRGB(40,40,55) ColWrap.BorderSizePixel = 0
+Instance.new("UICorner", ColWrap).CornerRadius = UDim.new(0,5)
+Instance.new("UIStroke", ColWrap).Color = STRK
+local ColBtn = Instance.new("TextButton", ColWrap)
+ColBtn.Size = UDim2.new(1,0,1,0) ColBtn.BackgroundTransparency = 1
+ColBtn.Text = "×" ColBtn.TextColor3 = TXT2
+ColBtn.TextSize = 16 ColBtn.Font = Enum.Font.GothamBold ColBtn.AutoButtonColor = false
+
+-- drag
+local dragging, dragStart, startPos
+TitleBar.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = true dragStart = i.Position startPos = Main.Position
+    end
+end)
+TitleBar.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+    end
+end)
+
+-- content frame
+local CF = Instance.new("Frame", Main)
+CF.Size = UDim2.new(1,0,1,-TITLE_H) CF.Position = UDim2.new(0,0,0,TITLE_H)
+CF.BackgroundTransparency = 1
+
+-- row factory
+local allRows = {}
+local function makeRow(label, yPos, keybind, color, cb)
+    local row = Instance.new("Frame", CF)
+    row.Size = UDim2.new(1,-18,0,ROW_H) row.Position = UDim2.new(0,9,0,yPos)
+    row.BackgroundColor3 = CARD row.BorderSizePixel = 0
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0,7)
+    local btn = Instance.new("TextButton", row)
+    btn.Size = UDim2.new(1,0,1,0) btn.BackgroundTransparency = 1
+    btn.Text = label btn.TextColor3 = TXT
+    btn.TextSize = 12 btn.Font = Enum.Font.GothamBlack
+    btn.AutoButtonColor = false btn.ZIndex = 2
+    if keybind then
+        local kb = Instance.new("TextLabel", row)
+        kb.Size = UDim2.new(0,20,0,16) kb.Position = UDim2.new(1,-24,0.5,-8)
+        kb.BackgroundColor3 = BG kb.BorderSizePixel = 0
+        kb.Text = keybind kb.TextColor3 = TXT2
+        kb.TextSize = 10 kb.Font = Enum.Font.GothamBold kb.ZIndex = 3
+        Instance.new("UICorner", kb).CornerRadius = UDim.new(0,4)
+    end
+    local hc = color or ORG
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(row, TWEEN_FAST, {BackgroundColor3=HOVER}):Play()
+        TweenService:Create(btn, TWEEN_FAST, {TextColor3=hc}):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(row, TWEEN_FAST, {BackgroundColor3=CARD}):Play()
+        TweenService:Create(btn, TWEEN_FAST, {TextColor3=TXT}):Play()
+    end)
+    if cb then btn.MouseButton1Click:Connect(function() task.spawn(cb, btn) end) end
+    table.insert(allRows, row)
+    return btn, row
+end
+
+-- toggle factory
+local function makeToggle(label, yPos, onColor, cb)
+    local row = Instance.new("Frame", CF)
+    row.Size = UDim2.new(1,-18,0,ROW_H) row.Position = UDim2.new(0,9,0,yPos)
+    row.BackgroundColor3 = CARD row.BorderSizePixel = 0
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0,7)
+    local rowStroke = Instance.new("UIStroke", row)
+    rowStroke.Color = STRK rowStroke.Thickness = 1.2
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(1,-54,1,0) lbl.Position = UDim2.new(0,10,0,0)
+    lbl.BackgroundTransparency = 1 lbl.Text = label
+    lbl.TextColor3 = TXT2 lbl.TextSize = 11
+    lbl.Font = Enum.Font.GothamBlack lbl.TextXAlignment = Enum.TextXAlignment.Left
+    local tr = Instance.new("Frame", row)
+    tr.Size = UDim2.new(0,36,0,18) tr.Position = UDim2.new(1,-44,0.5,-9)
+    tr.BackgroundColor3 = Color3.fromRGB(15,14,19) tr.BorderSizePixel = 0
+    Instance.new("UICorner", tr).CornerRadius = UDim.new(1,0)
+    local dt = Instance.new("Frame", tr)
+    dt.Size = UDim2.new(0,14,0,14) dt.Position = UDim2.new(0,2,0.5,-7)
+    dt.BackgroundColor3 = TXT2 dt.BorderSizePixel = 0
+    Instance.new("UICorner", dt).CornerRadius = UDim.new(1,0)
+    local clickBtn = Instance.new("TextButton", row)
+    clickBtn.Size = UDim2.new(1,0,1,0) clickBtn.BackgroundTransparency = 1
+    clickBtn.Text = "" clickBtn.AutoButtonColor = false clickBtn.ZIndex = 2
+    local OC = onColor or ORG
+    local function render(on)
+        lbl.TextColor3 = on and TXT or TXT2
+        TweenService:Create(tr, TWEEN_FAST, {BackgroundColor3 = on and OC or Color3.fromRGB(15,14,19)}):Play()
+        TweenService:Create(dt, TWEEN_FAST, {
+            Position = on and UDim2.new(1,-16,0.5,-7) or UDim2.new(0,2,0.5,-7),
+            BackgroundColor3 = on and BG or TXT2
+        }):Play()
+        TweenService:Create(rowStroke, TWEEN_FAST, {Color = on and OC or STRK}):Play()
+    end
+    local state = false
+    clickBtn.MouseButton1Click:Connect(function()
+        state = not state
+        render(state)
+        if cb then cb(state) end
+    end)
+    table.insert(allRows, row)
+    return row
+end
+
+-- compute Y positions
+local function rowY(i) return PAD_TOP + (i-1) * (ROW_H + ROW_GAP) end
+
+-- row 1: FLASH TP
+local flashBusy = false
+local flashBtn = makeRow("FLASH TP", rowY(1), "F", ORG, function(btn)
+    if flashBusy then return end
+    flashBusy = true
+    local char = plr.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then flashBusy = false return end
+    btn.Text = "EXECUTING..."
+
+    -- step 1: equip carpet and wait for it to land in character
+    equipTool("Flying Carpet")
+    local t = 0
+    while t < 20 and not char:FindFirstChild("Flying Carpet") do
+        RunService.Heartbeat:Wait() t += 1
+    end
+    task.wait(0.05)
+
+    -- step 2: teleport
+    local targetPos = Vector3.new(-344.03, -7.30, 63.29)
+    local targetRot = CFrame.fromEulerAnglesYXZ(math.rad(-12.9), math.rad(-20.0), 0)
+    hrp.CFrame = CFrame.new(targetPos) * targetRot
+    Camera.CFrame = CFrame.new(Camera.CFrame.Position) * targetRot
+    task.wait(0.15)
+
+    -- step 3: equip flash teleport and wait for it
+    equipTool("Flash Teleport")
+    t = 0
+    while t < 20 and not char:FindFirstChild("Flash Teleport") do
+        RunService.Heartbeat:Wait() t += 1
+    end
+    task.wait(0.05)
+
+    -- step 4: activate
+    local tool = char:FindFirstChild("Flash Teleport")
+    if tool then tool:Activate() end
+
+    -- step 5: block if enabled
+    if blockEnabled then
+        blockedSet = {}
+        task.spawn(function()
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= plr then blockPlayer(p) end
+            end
+        end)
+    end
+
+    task.wait(0.6)
+    btn.Text = "FLASH TP"
+    flashBusy = false
+end)
+
+-- row 2: BLOCK toggle
+makeToggle("BLOCK", rowY(2), RED, function(v) blockEnabled = v end)
+
+-- row 3: INSTANT RESET
+makeRow("INSTANT RESET", rowY(3), "R", RED, function()
+    doInstantReset()
+end)
+
+-- row 4: SPAM AP NEAREST
+makeRow("SPAM AP NEAREST", rowY(4), "E", RED, function(btn)
+    local root = getRoot(); if not root then return end
+    local nearest, dist = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= plr and p.Character then
+            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local d = (root.Position - hrp.Position).Magnitude
+                if d < dist then dist = d nearest = p end
+            end
+        end
+    end
+    if not nearest then return end
+    btn.Text = "SPAMMING..."
+    spamAP(nearest)
+    task.wait(0.6)
+    btn.Text = "SPAM AP NEAREST"
+end)
+
+-- row 5: AUTO RESET BALLOON toggle
+makeToggle("AUTO RESET BALLOON", rowY(5), ORG, function(v) autoResetBalloon = v end)
+
+-- collapse: show only flash tp row when minimized
+local collapsed = false
+ColBtn.MouseButton1Click:Connect(function()
+    collapsed = not collapsed
+    ColBtn.Text = collapsed and "+" or "×"
+    -- hide/show all rows except flash tp (index 1)
+    for i, row in ipairs(allRows) do
+        if i > 1 then row.Visible = not collapsed end
+    end
+    TweenService:Create(Main, TweenInfo.new(0.25,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),
+        {Size=UDim2.new(0,185,0,collapsed and MINI_H or FULL_H)}):Play()
+end)
+
+-- keybinds
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.F then
+        if not flashBusy then flashBtn.MouseButton1Click:Fire() end
+    elseif input.KeyCode == Enum.KeyCode.R then
+        doInstantReset()
+    elseif input.KeyCode == Enum.KeyCode.E then
+        local root = getRoot(); if not root then return end
+        local nearest, dist = nil, math.huge
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= plr and p.Character then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local d = (root.Position - hrp.Position).Magnitude
+                    if d < dist then dist = d nearest = p end
+                end
+            end
+        end
+        if nearest then spamAP(nearest) end
+    end
+end)
+
+print("VSZ Hub (Flash TP) loaded")
